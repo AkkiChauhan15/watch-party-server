@@ -11,130 +11,138 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// State Management
-// Stores host per room. Example: { 'test-party-123': { host: 'socket_id_abc' } }
+// Room state: { host, queue: [{url, title, addedBy, id}], currentUrl }
 const rooms = {};
+
+function getRoom(roomId) {
+    if (!rooms[roomId]) rooms[roomId] = { host: null, queue: [], currentUrl: null };
+    return rooms[roomId];
+}
+
+function playNextInQueue(roomId) {
+    const room = rooms[roomId];
+    if (!room || room.queue.length === 0) {
+        if (room) room.currentUrl = null;
+        io.to(roomId).emit('queue_empty');
+        return;
+    }
+    const next = room.queue.shift();
+    room.currentUrl = next.url;
+    console.log(`▶ Playing next in ${roomId}: ${next.title}`);
+    io.to(roomId).emit('navigate_to', { url: next.url, title: next.title });
+    io.to(roomId).emit('queue_update', { queue: room.queue, host: room.host });
+    io.to(roomId).emit('chat_message', {
+        sender: 'SYSTEM',
+        text: `▶ Now playing: "${next.title}" — added by ${next.addedBy}`,
+        isSystem: true
+    });
+}
 
 io.on('connection', (socket) => {
     console.log(`🟢 User connected: ${socket.id}`);
 
     socket.on('join_room', (roomId) => {
         socket.join(roomId);
-        console.log(`🚪 User ${socket.id} joined room: ${roomId}`);
+        socket.data.roomId = roomId;
+        const room = getRoom(roomId);
 
-        if (!rooms[roomId]) {
-            rooms[roomId] = { host: socket.id };
-            console.log(`👑 User ${socket.id} is the host of ${roomId}`);
+        if (!room.host) {
+            room.host = socket.id;
+            console.log(`👑 ${socket.id} is host of ${roomId}`);
         } else {
             const shortId = socket.id.substring(0, 4);
-            io.to(rooms[roomId].host).emit('latecomer_arrived', { newUserId: shortId });
+            io.to(room.host).emit('latecomer_arrived', { newUserId: shortId });
         }
+
+        // Send joining user the full current state
+        socket.emit('queue_update', { queue: room.queue, host: room.host });
+        if (room.currentUrl) socket.emit('navigate_to', { url: room.currentUrl, time: 0 });
     });
 
-    // Play / pause / seek — broadcast to everyone else in the room
-    socket.on('sync_state', (data) => {
-        socket.to(data.roomId).emit('sync_state', data);
-    });
+    socket.on('sync_state',       (data) => socket.to(data.roomId).emit('sync_state', data));
+    socket.on('chat_message',     (data) => socket.to(data.roomId).emit('chat_message', data));
+    socket.on('typing',           (data) => socket.to(data.roomId).emit('user_typing',  { sender: data.sender }));
+    socket.on('stopped_typing',   (data) => socket.to(data.roomId).emit('user_stopped', { sender: data.sender }));
+    socket.on('reaction',         (data) => socket.to(data.roomId).emit('reaction',     { emoji: data.emoji, sender: data.sender }));
+    socket.on('user_status',      (data) => socket.to(data.roomId).emit('user_status',  data));
 
-    // Chat messages — broadcast to everyone else in the room
-    socket.on('chat_message', (data) => {
-        console.log(`💬 Chat in ${data.roomId} from ${data.sender}: ${data.text}`);
-        socket.to(data.roomId).emit('chat_message', data);
-    });
-
-    // Typing indicator
-    socket.on('typing', (data) => {
-        socket.to(data.roomId).emit('user_typing', { sender: data.sender });
-    });
-
-    socket.on('stopped_typing', (data) => {
-        socket.to(data.roomId).emit('user_stopped', { sender: data.sender });
-    });
-
-    // Emoji reaction
-    socket.on('reaction', (data) => {
-        console.log(`🎉 Reaction in ${data.roomId} from ${data.sender}: ${data.emoji}`);
-        socket.to(data.roomId).emit('reaction', { emoji: data.emoji, sender: data.sender });
-    });
-
-    // =====================================================
-    // --- VOICE CALL SIGNALING (WebRTC via Socket.io) ---
-    // =====================================================
-    // The server is just a relay here — it never touches the audio.
-    // It only passes the WebRTC handshake messages between peers.
-
-    // Step 1 — Someone starts a call. Tell everyone else in the room.
-    socket.on('voice_call_started', (data) => {
-        console.log(`🎙️ Voice call started in room ${data.roomId} by ${data.sender}`);
-        socket.to(data.roomId).emit('voice_call_incoming', {
-            from: socket.id,
-            sender: data.sender,
-            roomId: data.roomId
+    // ── QUEUE: any member can add ──────────────────────────────
+    socket.on('queue_add', (data) => {
+        const { roomId, url, title, sender } = data;
+        const room = getRoom(roomId);
+        const item = { url, title: title || url, addedBy: sender, id: Date.now() };
+        room.queue.push(item);
+        io.to(roomId).emit('queue_update', { queue: room.queue, host: room.host });
+        io.to(roomId).emit('chat_message', {
+            sender: 'SYSTEM', text: `${sender} added "${item.title}" to the queue`, isSystem: true
         });
+        // Auto-start if nothing is playing
+        if (!room.currentUrl) playNextInQueue(roomId);
     });
 
-    // Step 2 — Caller sends their WebRTC offer to a specific peer
-    socket.on('voice_offer', (data) => {
-        // data.to = the socket.id of the person we want to call
-        console.log(`📞 voice_offer from ${socket.id} to ${data.to}`);
-        io.to(data.to).emit('voice_offer', {
-            offer: data.offer,
-            from: socket.id
-        });
+    // ── QUEUE: host-only controls ──────────────────────────────
+    socket.on('queue_remove', (data) => {
+        const room = getRoom(data.roomId);
+        if (room.host !== socket.id) return;
+        room.queue = room.queue.filter(i => i.id !== data.itemId);
+        io.to(data.roomId).emit('queue_update', { queue: room.queue, host: room.host });
     });
 
-    // Step 3 — Receiver sends their WebRTC answer back to the caller
-    socket.on('voice_answer', (data) => {
-        console.log(`📞 voice_answer from ${socket.id} to ${data.to}`);
-        io.to(data.to).emit('voice_answer', {
-            answer: data.answer,
-            from: socket.id
-        });
+    socket.on('queue_play_next', (data) => {
+        const room = getRoom(data.roomId);
+        if (room.host !== socket.id) return;
+        playNextInQueue(data.roomId);
     });
 
-    // Step 4 — Both sides exchange ICE candidates (network path info)
-    // This happens automatically and repeatedly as the browser discovers paths
-    socket.on('ice_candidate', (data) => {
-        io.to(data.to).emit('ice_candidate', {
-            candidate: data.candidate,
-            from: socket.id
-        });
+    socket.on('queue_play_item', (data) => {
+        const room = getRoom(data.roomId);
+        if (room.host !== socket.id) return;
+        const idx = room.queue.findIndex(i => i.id === data.itemId);
+        if (idx === -1) return;
+        const [item] = room.queue.splice(idx, 1);
+        room.queue.unshift(item);
+        playNextInQueue(data.roomId);
     });
 
-    // Step 5 — Someone ends the call. Notify the whole room.
-    socket.on('voice_call_ended', (data) => {
-        console.log(`📵 Voice call ended in room ${data.roomId}`);
-        socket.to(data.roomId).emit('voice_call_ended', { sender: data.sender });
+    socket.on('queue_reorder', (data) => {
+        const room = getRoom(data.roomId);
+        if (room.host !== socket.id) return;
+        const [moved] = room.queue.splice(data.fromIndex, 1);
+        room.queue.splice(data.toIndex, 0, moved);
+        io.to(data.roomId).emit('queue_update', { queue: room.queue, host: room.host });
     });
 
-    // Disconnect & host reassignment
+    // ── VOICE CALL ─────────────────────────────────────────────
+    socket.on('voice_call_started', (data) => socket.to(data.roomId).emit('voice_call_incoming', { from: socket.id, sender: data.sender, roomId: data.roomId }));
+    socket.on('voice_offer',        (data) => io.to(data.to).emit('voice_offer',   { offer: data.offer, from: socket.id }));
+    socket.on('voice_answer',       (data) => io.to(data.to).emit('voice_answer',  { answer: data.answer, from: socket.id }));
+    socket.on('ice_candidate',      (data) => io.to(data.to).emit('ice_candidate', { candidate: data.candidate, from: socket.id }));
+    socket.on('voice_call_ended',   (data) => socket.to(data.roomId).emit('voice_call_ended', { sender: data.sender }));
+
+    // ── DISCONNECT ─────────────────────────────────────────────
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${socket.id}`);
+        const roomId = socket.data.roomId;
+        if (!roomId || !rooms[roomId]) return;
 
-        // If a peer disconnects mid-call, notify their room
-        for (let roomId in rooms) {
+        const room = rooms[roomId];
+        socket.to(roomId).emit('voice_peer_disconnected', { socketId: socket.id });
+
+        if (room.host === socket.id) {
             const clients = io.sockets.adapter.rooms.get(roomId);
-            if (clients && clients.has(socket.id) === false) {
-                socket.to(roomId).emit('voice_peer_disconnected', { socketId: socket.id });
-            }
-        }
-
-        for (let roomId in rooms) {
-            if (rooms[roomId].host === socket.id) {
-                const clients = io.sockets.adapter.rooms.get(roomId);
-                if (clients && clients.size > 0) {
-                    rooms[roomId].host = [...clients][0];
-                    console.log(`👑 Host left. User ${rooms[roomId].host} is now host of ${roomId}`);
-                } else {
-                    delete rooms[roomId];
-                    console.log(`🗑️ Room ${roomId} is empty and has been deleted.`);
-                }
+            if (clients && clients.size > 0) {
+                room.host = [...clients][0];
+                io.to(roomId).emit('queue_update', { queue: room.queue, host: room.host });
+                io.to(roomId).emit('chat_message', { sender: 'SYSTEM', text: 'Host left — controls transferred.', isSystem: true });
+            } else {
+                delete rooms[roomId];
             }
         }
     });
 });
 
-server.listen(3000, () => {
-    console.log(`🚀 Watch Party Server running on http://localhost:3000`);
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Watch Party Server running on port ${PORT}`);
     console.log(`📡 Waiting for connections...`);
 });
