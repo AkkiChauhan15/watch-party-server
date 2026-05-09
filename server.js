@@ -11,12 +11,20 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Room state: { host, queue: [{url, title, addedBy, id}], currentUrl }
+// Keepalive ping endpoint (prevents Render free-tier cold starts)
+app.get('/ping', (req, res) => res.send('ok'));
+
 const rooms = {};
 
 function getRoom(roomId) {
     if (!rooms[roomId]) rooms[roomId] = { host: null, queue: [], currentUrl: null };
     return rooms[roomId];
+}
+
+// CHANGE 2: emit live viewer count to everyone in a room
+function emitRoomCount(roomId) {
+    const count = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+    io.to(roomId).emit('room_count', { count });
 }
 
 function playNextInQueue(roomId) {
@@ -57,6 +65,9 @@ io.on('connection', (socket) => {
         // Send joining user the full current state
         socket.emit('queue_update', { queue: room.queue, host: room.host });
         if (room.currentUrl) socket.emit('navigate_to', { url: room.currentUrl, time: 0 });
+
+        // CHANGE 2: broadcast updated count to everyone including the new joiner
+        emitRoomCount(roomId);
     });
 
     socket.on('sync_state',       (data) => socket.to(data.roomId).emit('sync_state', data));
@@ -66,7 +77,7 @@ io.on('connection', (socket) => {
     socket.on('reaction',         (data) => socket.to(data.roomId).emit('reaction',     { emoji: data.emoji, sender: data.sender }));
     socket.on('user_status',      (data) => socket.to(data.roomId).emit('user_status',  data));
 
-    // ── QUEUE: any member can add ──────────────────────────────
+    // Queue: any member can add
     socket.on('queue_add', (data) => {
         const { roomId, url, title, sender } = data;
         const room = getRoom(roomId);
@@ -76,11 +87,10 @@ io.on('connection', (socket) => {
         io.to(roomId).emit('chat_message', {
             sender: 'SYSTEM', text: `${sender} added "${item.title}" to the queue`, isSystem: true
         });
-        // Auto-start if nothing is playing
         if (!room.currentUrl) playNextInQueue(roomId);
     });
 
-    // ── QUEUE: host-only controls ──────────────────────────────
+    // Queue: host-only controls
     socket.on('queue_remove', (data) => {
         const room = getRoom(data.roomId);
         if (room.host !== socket.id) return;
@@ -112,14 +122,14 @@ io.on('connection', (socket) => {
         io.to(data.roomId).emit('queue_update', { queue: room.queue, host: room.host });
     });
 
-    // ── VOICE CALL ─────────────────────────────────────────────
+    // Voice call signaling
     socket.on('voice_call_started', (data) => socket.to(data.roomId).emit('voice_call_incoming', { from: socket.id, sender: data.sender, roomId: data.roomId }));
     socket.on('voice_offer',        (data) => io.to(data.to).emit('voice_offer',   { offer: data.offer, from: socket.id }));
     socket.on('voice_answer',       (data) => io.to(data.to).emit('voice_answer',  { answer: data.answer, from: socket.id }));
     socket.on('ice_candidate',      (data) => io.to(data.to).emit('ice_candidate', { candidate: data.candidate, from: socket.id }));
     socket.on('voice_call_ended',   (data) => socket.to(data.roomId).emit('voice_call_ended', { sender: data.sender }));
 
-    // ── DISCONNECT ─────────────────────────────────────────────
+    // Disconnect & host reassignment
     socket.on('disconnect', () => {
         console.log(`🔴 User disconnected: ${socket.id}`);
         const roomId = socket.data.roomId;
@@ -136,8 +146,12 @@ io.on('connection', (socket) => {
                 io.to(roomId).emit('chat_message', { sender: 'SYSTEM', text: 'Host left — controls transferred.', isSystem: true });
             } else {
                 delete rooms[roomId];
+                return; // room gone, no count to emit
             }
         }
+
+        // CHANGE 2: broadcast updated count after someone leaves
+        emitRoomCount(roomId);
     });
 });
 
